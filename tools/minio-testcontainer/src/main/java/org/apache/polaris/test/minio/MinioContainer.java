@@ -37,8 +37,11 @@ import org.testcontainers.containers.wait.strategy.HttpWaitStrategy;
 import org.testcontainers.utility.Base58;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.core.checksums.RequestChecksumCalculation;
+import software.amazon.awssdk.core.checksums.ResponseChecksumValidation;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
 import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.LegacyMd5Plugin;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.CreateBucketRequest;
 
@@ -273,6 +276,13 @@ public final class MinioContainer extends GenericContainer<MinioContainer>
         // credentialsProvider(s3AccessKeyId, s3SecretAccessKey, s3SessionToken)
         .credentialsProvider(
             StaticCredentialsProvider.create(AwsBasicCredentials.create(accessKey(), secretKey())))
+        // Ensure single-client checksum behavior to interoperate with S3-compatible endpoints
+        // (ECS/Minio). Also disable chunked encoding signing for this client so we do not
+        // send streaming-signature/trailer payloads (STREAMING-UNSIGNED-PAYLOAD-TRAILER)
+        // which many on-prem S3-compatible endpoints (ECS/older Minio/ViPR) don't accept.
+        .requestChecksumCalculation(RequestChecksumCalculation.WHEN_REQUIRED)
+        .responseChecksumValidation(ResponseChecksumValidation.WHEN_REQUIRED)
+        .addPlugin(LegacyMd5Plugin.create())
         .build();
   }
 }

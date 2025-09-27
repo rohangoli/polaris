@@ -1,0 +1,249 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+services:
+
+  rsa-key-generator:
+    image: alpine/openssl
+    volumes:
+      - polaris_keys:/keys
+    entrypoint: "/bin/sh"
+    command:
+      - "-c"
+      - >-
+        echo "Generating RSA key-pair for Polaris token broker...";
+        if [ ! -f /keys/private.key ] || [ ! -f /keys/public.key ]; then
+          echo "Generating new RSA key-pair...";
+          openssl genpkey -algorithm RSA -out /keys/private.key -pkeyopt rsa_keygen_bits:2048;
+          openssl rsa -in /keys/private.key -pubout -out /keys/public.key;
+          chmod 644 /keys/private.key;
+          chmod 644 /keys/public.key;
+          echo "RSA key-pair generated successfully";
+        else
+          echo "RSA key-pair already exists, skipping generation";
+        fi;
+
+  postgres:
+    image: postgres:18.0
+    ports:
+      - "5432:5432"
+    # set shared memory limit when using docker-compose
+    shm_size: 128mb
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: POLARIS
+      POSTGRES_INITDB_ARGS: "--encoding UTF8 --data-checksums"
+    volumes:
+      # Persistent data volume for PostgreSQL
+      - postgres_data:/var/lib/postgresql/data
+      # Bind local conf file to a convenient location in the container
+      - ../assets/postgres/postgresql.conf:/etc/postgresql/postgresql.conf
+    command:
+      - "postgres"
+      - "-c"
+      - "config_file=/etc/postgresql/postgresql.conf"
+    healthcheck:
+      test: "pg_isready -U postgres"
+      interval: 5s
+      timeout: 2s
+      retries: 15
+
+  polaris-bootstrap:
+    image: apache/polaris-admin-tool:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - POLARIS_PERSISTENCE_TYPE=relational-jdbc
+      - QUARKUS_DATASOURCE_JDBC_URL=jdbc:postgresql://postgres:5432/POLARIS
+      - QUARKUS_DATASOURCE_USERNAME=postgres
+      - QUARKUS_DATASOURCE_PASSWORD=postgres
+    command:
+      - "bootstrap"
+      - "--realm=realm-internal"
+      - "--realm=realm-external" 
+      - "--realm=realm-mixed"
+      - "--credential=realm-internal,root,s3cr3t"
+      - "--credential=realm-external,root,s3cr3t"
+      - "--credential=realm-mixed,root,s3cr3t"
+
+  polaris:
+    image: apache/polaris:latest
+    ports:
+      # API port
+      - "8181:8181"
+      # Management port (metrics and health checks)
+      - "8182:8182"
+      # Optional, allows attaching a debugger to the Polaris JVM
+      - "5005:5005"
+    volumes:
+      - polaris_keys:/tmp/keys:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      polaris-bootstrap:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_healthy
+      endpoint-verification:
+        condition: service_completed_successfully
+      rsa-key-generator:
+        condition: service_completed_successfully
+    environment:
+      JAVA_DEBUG: "true"
+      JAVA_DEBUG_PORT: "*:5005"
+      # PostgreSQL persistence configuration
+      POLARIS_PERSISTENCE_TYPE: relational-jdbc
+      POLARIS_PERSISTENCE_RELATIONAL_JDBC_MAX_RETRIES: 5
+      POLARIS_PERSISTENCE_RELATIONAL_JDBC_INITIAL_DELAY_IN_MS: 100
+      POLARIS_PERSISTENCE_RELATIONAL_JDBC_MAX_DURATION_IN_MS: 5000
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://postgres:5432/POLARIS
+      QUARKUS_DATASOURCE_USERNAME: postgres
+      QUARKUS_DATASOURCE_PASSWORD: postgres
+      # AWS S3 configuration
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: AKIA914B58000A66FBBE
+      AWS_SECRET_ACCESS_KEY: 4yTK6JEBwlTCpiuDGc+e8+d9G3no8qdKzYuYsuVw
+      # S3-compatible storage configuration for Polaris catalogs to disable STREAMING-UNSIGNED-PAYLOAD-TRAILER
+      AWS_REQUEST_CHECKSUM_CALCULATION: WHEN_REQUIRED
+      AWS_RESPONSE_CHECKSUM_VALIDATION: WHEN_REQUIRED
+      # Polaris realm and authentication configuration
+      POLARIS_BOOTSTRAP_CREDENTIALS: realm-internal,root,s3cr3t;realm-external,root,s3cr3t;realm-mixed,root,s3cr3t
+      polaris.realm-context.realms: realm-internal,realm-external,realm-mixed
+      polaris.authentication.type: internal
+      polaris.authentication."realm-external".type: external
+      polaris.authentication."realm-mixed".type: mixed
+      # OIDC configuration for Keycloak integration
+      quarkus.oidc.tenant-enabled: "true"
+      quarkus.oidc.auth-server-url: http://keycloak:8080/realms/iceberg
+      quarkus.oidc.client-id: client1
+      quarkus.oidc.roles.role-claim-path: principal_roles
+      polaris.oidc.principal-mapper.id-claim-path: principal_id
+      polaris.oidc.principal-mapper.name-claim-path: principal_name
+      polaris.oidc.principal-roles-mapper.mappings[0].regex: (.+)
+      polaris.oidc.principal-roles-mapper.mappings[0].replacement: PRINCIPAL_ROLE:$$1
+      # RSA Token Broker Configuration
+      polaris.authentication.token-broker.type: rsa-key-pair
+      polaris.authentication.token-broker.rsa-key-pair.public-key-file: /tmp/keys/public.key
+      polaris.authentication.token-broker.rsa-key-pair.private-key-file: /tmp/keys/private.key
+      # Feature flags
+      polaris.features."ALLOW_INSECURE_STORAGE_TYPES": "false"
+      polaris.features."SUPPORTED_CATALOG_STORAGE_TYPES": "[\"S3\",\"GCS\",\"AZURE\"]"
+      polaris.readiness.ignore-severe-issues: "true"
+    healthcheck:
+      test: ["CMD", "curl", "http://localhost:8182/q/health"]
+      interval: 2s
+      timeout: 10s
+      retries: 10
+      start_period: 10s
+
+  endpoint-verification:
+    image: alpine/curl
+    environment:
+      - STORAGE_ENDPOINT=ecs-lb.example.com
+      - STS_ENDPOINT=https://ecs.example.com:4443/sts
+    entrypoint: "/bin/sh"
+    command:
+      - "-c"
+      - >-
+        echo "Verifying storage endpoint connectivity...";
+        if ! nslookup $${STORAGE_ENDPOINT}; then
+          echo "ERROR: Cannot resolve storage endpoint $${STORAGE_ENDPOINT}";
+          exit 1;
+        fi;
+        echo "DNS resolution for storage endpoint successful";
+        
+        echo "Verifying storage endpoint connectivity...";
+        if ! curl -f --connect-timeout 10 --max-time 30 -k "https://$${STORAGE_ENDPOINT}" 2>/dev/null; then
+          echo "WARNING: Storage endpoint $${STORAGE_ENDPOINT} may not be accessible via HTTPS";
+        else
+          echo "Storage endpoint connectivity verified";
+        fi;
+        
+        echo "Verifying STS endpoint connectivity...";
+        if ! curl -f --connect-timeout 10 --max-time 30 -k "$${STS_ENDPOINT}" 2>/dev/null; then
+          echo "WARNING: STS endpoint $${STS_ENDPOINT} may not be accessible";
+        else
+          echo "STS endpoint connectivity verified";
+        fi;
+        
+        echo "Endpoint verification completed successfully";
+
+  polaris-setup:
+    image: alpine/curl
+    depends_on:
+      polaris:
+        condition: service_healthy
+      endpoint-verification:
+        condition: service_completed_successfully
+    environment:
+      - CLIENT_ID=root
+      - CLIENT_SECRET=s3cr3t
+    volumes:
+      - ../assets/polaris/:/polaris
+    entrypoint: "/bin/sh"
+    command:
+      - "-c"
+      - >-
+        apk add --no-cache jq && 
+        chmod +x /polaris/create-catalog.sh && 
+        token=$$(curl http://keycloak:8080/realms/iceberg/protocol/openid-connect/token --user client1:s3cr3t -d 'grant_type=client_credentials' | jq -r .access_token) && 
+        echo Creating catalog...;
+        export STORAGE_CONFIG_INFO='{"storageType":"S3",
+          "endpoint":"https://ecs-lb.example.com",
+          "stsEndpoint":"https://ecs.example.com:4443/sts",
+          "region":"us-east-1",
+          "roleArn":"urn:ecs:iam::test-namespace:role/test-role",
+          "pathStyleAccess":true,
+          "ignoreSSLVerification":true}';
+        export STORAGE_LOCATION='s3://polaris';
+        /polaris/create-catalog.sh realm-internal && 
+        /polaris/create-catalog.sh realm-external $$token && 
+        /polaris/create-catalog.sh realm-mixed $$token &&
+        echo Extra grants...;
+        curl -H "Authorization: Bearer $$token" -H 'Content-Type: application/json' \
+          -X PUT \
+          http://polaris:8181/api/management/v1/catalogs/quickstart_catalog/catalog-roles/catalog_admin/grants \
+          -d '{"type":"catalog", "privilege":"CATALOG_MANAGE_CONTENT"}';
+        echo Done.;
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.3.5
+    ports:
+      - "8080:8080"
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+    volumes:
+      - ../assets/keycloak/iceberg-realm.json:/opt/keycloak/data/import/iceberg-realm.json
+    command: [
+      "start-dev",
+      "--import-realm",
+      "--health-enabled=true"
+    ]
+    healthcheck:
+      test: "exec 3<>/dev/tcp/localhost/9000 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200 OK'"
+      interval: 5s
+      timeout: 2s
+      retries: 15
+
+volumes:
+  postgres_data:
+    driver: local
+  polaris_keys:
+    driver: local

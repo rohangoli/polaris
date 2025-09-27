@@ -27,12 +27,16 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Stream;
+import org.apache.iceberg.exceptions.UnprocessableEntityException;
 import org.apache.polaris.core.config.RealmConfig;
+import org.apache.polaris.core.secrets.EcsXmlParser;
 import org.apache.polaris.core.storage.AccessConfig;
 import org.apache.polaris.core.storage.InMemoryStorageIntegration;
 import org.apache.polaris.core.storage.StorageAccessProperty;
 import org.apache.polaris.core.storage.StorageUtil;
 import org.apache.polaris.core.storage.aws.StsClientProvider.StsDestination;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.policybuilder.iam.IamConditionOperator;
 import software.amazon.awssdk.policybuilder.iam.IamEffect;
@@ -46,6 +50,7 @@ import software.amazon.awssdk.services.sts.model.AssumeRoleResponse;
 /** Credential vendor that supports generating */
 public class AwsCredentialsStorageIntegration
     extends InMemoryStorageIntegration<AwsStorageConfigurationInfo> {
+  private static final Logger LOG = LoggerFactory.getLogger(AwsCredentialsStorageIntegration.class);
   private final StsClientProvider stsClientProvider;
   private final Optional<AwsCredentialsProvider> credentialsProvider;
 
@@ -79,18 +84,39 @@ public class AwsCredentialsStorageIntegration
     int storageCredentialDurationSeconds =
         realmConfig.getConfig(STORAGE_CREDENTIAL_DURATION_SECONDS);
     AwsStorageConfigurationInfo storageConfig = config();
+    final String policyJson =
+        policyString(
+                storageConfig.getAwsPartition(),
+                allowListOperation,
+                allowedReadLocations,
+                allowedWriteLocations)
+            .toJson();
+
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Generated AssumeRole policy: {}", policyJson);
+    }
+
+    // Debug: dump raw and normalized endpoint information to help diagnose propagation
+    try {
+      if (LOG.isDebugEnabled()) {
+        LOG.debug(
+            "StorageConfig endpoints: endpoint='{}' endpointInternal='{}' pathStyleAccess='{}' -> endpointUri='{}' internalEndpointUri='{}'",
+            storageConfig.getEndpoint(),
+            storageConfig.getEndpointInternal(),
+            storageConfig.getPathStyleAccess(),
+            storageConfig.getEndpointUri(),
+            storageConfig.getInternalEndpointUri());
+      }
+    } catch (Exception e) {
+      LOG.debug("Failed to log storage config endpoints", e);
+    }
+
     AssumeRoleRequest.Builder request =
         AssumeRoleRequest.builder()
             .externalId(storageConfig.getExternalId())
             .roleArn(storageConfig.getRoleARN())
             .roleSessionName("PolarisAwsCredentialsStorageIntegration")
-            .policy(
-                policyString(
-                        storageConfig.getAwsPartition(),
-                        allowListOperation,
-                        allowedReadLocations,
-                        allowedWriteLocations)
-                    .toJson())
+            .policy(policyJson)
             .durationSeconds(storageCredentialDurationSeconds);
     credentialsProvider.ifPresent(
         cp -> request.overrideConfiguration(b -> b.credentialsProvider(cp)));
@@ -99,9 +125,119 @@ public class AwsCredentialsStorageIntegration
     @SuppressWarnings("resource")
     // Note: stsClientProvider returns "thin" clients that do not need closing
     StsClient stsClient =
-        stsClientProvider.stsClient(StsDestination.of(storageConfig.getStsEndpointUri(), region));
+        stsClientProvider.stsClient(
+            StsDestination.of(
+                storageConfig.getStsEndpointUri(),
+                region,
+                storageConfig.getIgnoreSSLVerification()));
 
-    AssumeRoleResponse response = stsClient.assumeRole(request.build());
+    AssumeRoleResponse response;
+    try {
+      response = stsClient.assumeRole(request.build());
+    } catch (software.amazon.awssdk.services.sts.model.StsException se) {
+      String msg = se.getMessage() == null ? "" : se.getMessage();
+      LOG.warn("AssumeRole failed: {}. Attempting fallback policy with AWS arn prefix.", msg);
+      if (msg.contains("Policy has invalid resource") || msg.contains("invalid resource")) {
+        // retry with AWS-style ARNs only (force partition to 'aws')
+        final String fallbackPolicyJson =
+            policyString("aws", allowListOperation, allowedReadLocations, allowedWriteLocations)
+                .toJson();
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("Retrying AssumeRole with fallback policy: {}", fallbackPolicyJson);
+        }
+        AssumeRoleRequest retryRequest = request.policy(fallbackPolicyJson).build();
+        response = stsClient.assumeRole(retryRequest);
+      } else {
+        throw se;
+      }
+    }
+    // Some STS endpoints (especially custom/on-prem ECS variants) may return a successful
+    // HTTP response but the SDK-parsed AssumeRoleResponse.credentials() may be null.
+    // Detect that and attempt a single retry using the AWS-style fallback policy; if we still
+    // don't receive credentials, surface a clear error with the raw response for diagnostics.
+    if (response == null || response.credentials() == null) {
+      LOG.warn(
+          "AssumeRole returned empty credentials (response={}). Attempting one retry with AWS arn prefix.",
+          response);
+      final String fallbackPolicyJson =
+          policyString("aws", allowListOperation, allowedReadLocations, allowedWriteLocations)
+              .toJson();
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("Retrying AssumeRole with fallback policy: {}", fallbackPolicyJson);
+      }
+      AssumeRoleRequest retryRequest = request.policy(fallbackPolicyJson).build();
+      response = stsClient.assumeRole(retryRequest);
+      // If SDK still didn't populate credentials, attempt to parse the raw XML captured
+      // by the StsClientsPool debug interceptor (best-effort). This helps with some ECS
+      // on-prem STS endpoints that return non-standard xmlns values that confuse the SDK.
+      if (response == null || response.credentials() == null) {
+        try {
+          java.util.Optional<String> rawOpt = stsClientProvider.lastRawBody();
+          if (rawOpt.isPresent()) {
+            String raw = rawOpt.get();
+            EcsXmlParser.Credentials creds = EcsXmlParser.parse(raw);
+            if (creds != null) {
+              // Build a synthetic AssumeRoleResponse-like mapping by directly filling AccessConfig
+              AccessConfig.Builder accessConfigFallback = AccessConfig.builder();
+              accessConfigFallback.put(StorageAccessProperty.AWS_KEY_ID, creds.getAccessKeyId());
+              accessConfigFallback.put(
+                  StorageAccessProperty.AWS_SECRET_KEY, creds.getSecretAccessKey());
+              accessConfigFallback.put(StorageAccessProperty.AWS_TOKEN, creds.getSessionToken());
+              if (creds.getExpiration() != null) {
+                try {
+                  long epoch = java.time.Instant.parse(creds.getExpiration()).toEpochMilli();
+                  accessConfigFallback.put(
+                      StorageAccessProperty.EXPIRATION_TIME, String.valueOf(epoch));
+                  accessConfigFallback.put(
+                      StorageAccessProperty.AWS_SESSION_TOKEN_EXPIRES_AT_MS, String.valueOf(epoch));
+                } catch (Exception e) {
+                  // If parsing fails, skip expiration fields
+                }
+              }
+              // Copy metadata from the storage config into the fallback AccessConfig so
+              // downstream consumers (e.g. DefaultFileIOFactory -> Iceberg S3FileIO) can
+              // honor endpoint overrides, path-style access, region, and refresh endpoints.
+              if (region != null) {
+                accessConfigFallback.put(StorageAccessProperty.CLIENT_REGION, region);
+              }
+
+              refreshCredentialsEndpoint.ifPresent(
+                  endpoint ->
+                      accessConfigFallback.put(
+                          StorageAccessProperty.AWS_REFRESH_CREDENTIALS_ENDPOINT, endpoint));
+
+              URI fbEndpointUri = storageConfig.getEndpointUri();
+              if (fbEndpointUri != null) {
+                accessConfigFallback.put(
+                    StorageAccessProperty.AWS_ENDPOINT, fbEndpointUri.toString());
+              }
+              URI fbInternalEndpointUri = storageConfig.getInternalEndpointUri();
+              if (fbInternalEndpointUri != null) {
+                accessConfigFallback.putInternalProperty(
+                    StorageAccessProperty.AWS_ENDPOINT.getPropertyName(),
+                    fbInternalEndpointUri.toString());
+              }
+
+              if (Boolean.TRUE.equals(storageConfig.getPathStyleAccess())) {
+                accessConfigFallback.put(
+                    StorageAccessProperty.AWS_PATH_STYLE_ACCESS, Boolean.TRUE.toString());
+              }
+
+              LOG.info("Successfully parsed ECS STS XML fallback and extracted credentials");
+              return accessConfigFallback.build();
+            }
+          }
+        } catch (Exception e) {
+          LOG.debug("ECS XML fallback parse failed", e);
+        }
+      }
+      if (response == null || response.credentials() == null) {
+        String respStr = response == null ? "null" : response.toString();
+        LOG.error("AssumeRole retry did not return credentials. response={}", respStr);
+        throw new UnprocessableEntityException("Failed to get subscoped credentials: %s", respStr);
+      }
+    }
+
     AccessConfig.Builder accessConfig = AccessConfig.builder();
     accessConfig.put(StorageAccessProperty.AWS_KEY_ID, response.credentials().accessKeyId());
     accessConfig.put(
@@ -171,16 +307,26 @@ public class AwsCredentialsStorageIntegration
     Map<String, IamStatement.Builder> bucketListStatementBuilder = new HashMap<>();
     Map<String, IamStatement.Builder> bucketGetLocationStatementBuilder = new HashMap<>();
 
-    String arnPrefix = arnPrefixForPartition(awsPartition);
+    final String arnPrefix = arnPrefixForPartition(awsPartition);
+    // For S3-compatible providers that return partition 'ecs', the policy
+    // resources should use the AWS-style S3 ARN prefix (arn:aws:s3:::). For
+    // real AWS partitions (aws, aws-us-gov, aws-cn) use the configured
+    // partition's prefix. This preserves deterministic policy output while
+    // allowing ECS to receive AWS-style ARNs as expected by tests and some
+    // S3-compatible endpoints.
+    final String preferredArnPrefix =
+        "ecs".equals(awsPartition) ? arnPrefixForPartition("aws") : arnPrefix;
     Stream.concat(readLocations.stream(), writeLocations.stream())
         .distinct()
         .forEach(
             location -> {
               URI uri = URI.create(location);
+              // add only object-level resource using the configured partition prefix.
               allowGetObjectStatementBuilder.addResource(
                   IamResource.create(
-                      arnPrefix + StorageUtil.concatFilePrefixes(parseS3Path(uri), "*", "/")));
-              final var bucket = arnPrefix + StorageUtil.getBucket(uri);
+                      preferredArnPrefix
+                          + StorageUtil.concatFilePrefixes(parseS3Path(uri), "*", "/")));
+              final var bucket = preferredArnPrefix + StorageUtil.getBucket(uri);
               if (allowList) {
                 bucketListStatementBuilder
                     .computeIfAbsent(
@@ -213,9 +359,12 @@ public class AwsCredentialsStorageIntegration
       writeLocations.forEach(
           location -> {
             URI uri = URI.create(location);
+            // add object-level resources for write operations only using configured
+            // partition prefix.
             allowPutObjectStatementBuilder.addResource(
                 IamResource.create(
-                    arnPrefix + StorageUtil.concatFilePrefixes(parseS3Path(uri), "*", "/")));
+                    preferredArnPrefix
+                        + StorageUtil.concatFilePrefixes(parseS3Path(uri), "*", "/")));
           });
       policyBuilder.addStatement(allowPutObjectStatementBuilder.build());
     }

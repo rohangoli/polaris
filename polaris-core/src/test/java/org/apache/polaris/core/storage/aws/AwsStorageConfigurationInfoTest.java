@@ -134,4 +134,83 @@ public class AwsStorageConfigurationInfoTest {
             AwsStorageConfigurationInfo::getAwsPartition)
         .containsExactly("arn:aws:iam::012345678901:role/jdoe", "012345678901", "aws");
   }
+
+  @Test
+  public void testS3CompatibleArnParsing() {
+    AwsStorageConfigurationInfo s3Config =
+        AwsStorageConfigurationInfo.builder()
+            .addAllowedLocation("s3://bucket/path/to/warehouse")
+            .roleARN("urn:ecs:iam::namespace:role/test-role")
+            .region("us-east-2")
+            .build();
+
+    Assertions.assertThat(s3Config)
+        .extracting(
+            AwsStorageConfigurationInfo::getRoleARN,
+            AwsStorageConfigurationInfo::getAwsAccountId,
+            AwsStorageConfigurationInfo::getAwsPartition)
+        .containsExactly("urn:ecs:iam::namespace:role/test-role", "namespace", "ecs");
+  }
+
+  @Test
+  public void testAwsUsGovArnParsing() {
+    AwsStorageConfigurationInfo awsGovConfig =
+        AwsStorageConfigurationInfo.builder()
+            .addAllowedLocation("s3://bucket/path/to/warehouse")
+            .roleARN("arn:aws-us-gov:iam::012345678901:role/gov-role")
+            .region("us-gov-east-1")
+            .build();
+
+    Assertions.assertThat(awsGovConfig)
+        .extracting(
+            AwsStorageConfigurationInfo::getRoleARN,
+            AwsStorageConfigurationInfo::getAwsAccountId,
+            AwsStorageConfigurationInfo::getAwsPartition)
+        .containsExactly(
+            "arn:aws-us-gov:iam::012345678901:role/gov-role", "012345678901", "aws-us-gov");
+  }
+
+  @Test
+  public void testArnValidation() {
+    // Test valid AWS ARN
+    Assertions.assertThatCode(
+            () ->
+                AwsStorageConfigurationInfo.validateArn("arn:aws:iam::123456789012:role/test-role"))
+        .doesNotThrowAnyException();
+
+    // Test valid AWS US Gov ARN
+    Assertions.assertThatCode(
+            () ->
+                AwsStorageConfigurationInfo.validateArn(
+                    "arn:aws-us-gov:iam::123456789012:role/test-role"))
+        .doesNotThrowAnyException();
+
+    // Test valid S3-compatible ARN
+    Assertions.assertThatCode(
+            () -> AwsStorageConfigurationInfo.validateArn("urn:ecs:iam::namespace:role/test-role"))
+        .doesNotThrowAnyException();
+
+    // Test null ARN (should be allowed)
+    Assertions.assertThatCode(() -> AwsStorageConfigurationInfo.validateArn(null))
+        .doesNotThrowAnyException();
+
+    // Test empty ARN (should fail)
+    Assertions.assertThatThrownBy(() -> AwsStorageConfigurationInfo.validateArn(""))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessage("ARN must not be empty");
+
+    // Test invalid ARN format (should fail)
+    Assertions.assertThatThrownBy(
+            () -> AwsStorageConfigurationInfo.validateArn("invalid:arn:format"))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("Invalid role ARN format");
+
+    // Test AWS China ARN (should fail)
+    Assertions.assertThatThrownBy(
+            () ->
+                AwsStorageConfigurationInfo.validateArn(
+                    "arn:aws-cn:iam::123456789012:role/test-role"))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessage("AWS China is temporarily not supported");
+  }
 }

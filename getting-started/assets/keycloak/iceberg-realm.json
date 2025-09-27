@@ -323,10 +323,16 @@
       "clientAuthenticatorType": "client-secret",
       "secret": "s3cr3t",
       "redirectUris": [
-        "http://localhost*"
+        "https://localhost:8443/polaris/callback",
+        "https://keycloak:8443/polaris/callback",
+        "http://localhost:8080/polaris/callback",
+        "http://127.0.0.1:8080/polaris/callback"
       ],
       "webOrigins": [
-        "http://localhost*"
+        "https://localhost:8443",
+        "https://keycloak:8443",
+        "http://localhost:8080",
+        "http://127.0.0.1:8080"
       ],
       "notBefore": 0,
       "bearerOnly": false,

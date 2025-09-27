@@ -156,6 +156,7 @@ public class CatalogEntity extends PolarisEntity implements LocationBasedEntity 
             .setStsEndpoint(awsConfig.getStsEndpoint())
             .setPathStyleAccess(awsConfig.getPathStyleAccess())
             .setEndpointInternal(awsConfig.getEndpointInternal())
+            .setIgnoreSSLVerification(awsConfig.getIgnoreSSLVerification())
             .build();
       }
       if (configInfo instanceof AzureStorageConfigurationInfo) {
@@ -300,6 +301,7 @@ public class CatalogEntity extends PolarisEntity implements LocationBasedEntity 
                     .stsEndpoint(awsConfigModel.getStsEndpoint())
                     .pathStyleAccess(awsConfigModel.getPathStyleAccess())
                     .endpointInternal(awsConfigModel.getEndpointInternal())
+                    .ignoreSSLVerification(awsConfigModel.getIgnoreSSLVerification())
                     .build();
             config = awsConfig;
             break;

@@ -42,6 +42,15 @@ public interface StsClientProvider {
    */
   StsClient stsClient(StsDestination destination);
 
+  /**
+   * Returns the last raw STS HTTP response body captured for the current thread, if available. This
+   * is intended as a safe programmatic API for fallback parsing when the SDK fails to populate
+   * credentials. Avoid relying on JVM system properties for this data.
+   */
+  default java.util.Optional<String> lastRawBody() {
+    return java.util.Optional.empty();
+  }
+
   @PolarisImmutable
   interface StsDestination {
     /** Corresponds to {@link StsBaseClientBuilder#endpointProvider(StsEndpointProvider)} */
@@ -52,8 +61,21 @@ public interface StsClientProvider {
     @Value.Parameter(order = 2)
     Optional<String> region();
 
+    /** Whether to ignore SSL certificate verification */
+    @Value.Parameter(order = 3)
+    Optional<Boolean> ignoreSSLVerification();
+
     static StsDestination of(@Nullable URI endpoint, @Nullable String region) {
-      return ImmutableStsDestination.of(Optional.ofNullable(endpoint), Optional.ofNullable(region));
+      return ImmutableStsDestination.of(
+          Optional.ofNullable(endpoint), Optional.ofNullable(region), Optional.empty());
+    }
+
+    static StsDestination of(
+        @Nullable URI endpoint, @Nullable String region, @Nullable Boolean ignoreSSLVerification) {
+      return ImmutableStsDestination.of(
+          Optional.ofNullable(endpoint),
+          Optional.ofNullable(region),
+          Optional.ofNullable(ignoreSSLVerification));
     }
   }
 }

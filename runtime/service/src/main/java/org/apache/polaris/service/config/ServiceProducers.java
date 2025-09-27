@@ -34,6 +34,10 @@ import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.Context;
 import java.time.Clock;
 import java.util.stream.Collectors;
+import javax.net.ssl.SSLContext;
+import org.apache.http.conn.ssl.NoopHostnameVerifier;
+import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
+import org.apache.http.ssl.SSLContextBuilder;
 import org.apache.polaris.core.PolarisCallContext;
 import org.apache.polaris.core.PolarisDefaultDiagServiceImpl;
 import org.apache.polaris.core.PolarisDiagnostics;
@@ -226,6 +230,42 @@ public class ServiceProducers {
     return httpClient.build();
   }
 
+  /**
+   * Creates an HTTP client that bypasses SSL certificate verification. WARNING: This should only be
+   * used for development and testing environments.
+   */
+  public SdkHttpClient createInsecureHttpClient(S3AccessConfig config) {
+    try {
+      // Create SSL context that trusts all certificates
+      SSLContext sslContext =
+          SSLContextBuilder.create().loadTrustMaterial(null, (chain, authType) -> true).build();
+
+      // Create socket factory with hostname verification disabled
+      SSLConnectionSocketFactory socketFactory =
+          new SSLConnectionSocketFactory(sslContext, NoopHostnameVerifier.INSTANCE);
+
+      ApacheHttpClient.Builder httpClient = ApacheHttpClient.builder().socketFactory(socketFactory);
+
+      // Apply standard configuration
+      config.maxHttpConnections().ifPresent(httpClient::maxConnections);
+      config.readTimeout().ifPresent(httpClient::socketTimeout);
+      config.connectTimeout().ifPresent(httpClient::connectionTimeout);
+      config.connectionAcquisitionTimeout().ifPresent(httpClient::connectionAcquisitionTimeout);
+      config.connectionMaxIdleTime().ifPresent(httpClient::connectionMaxIdleTime);
+      config.connectionTimeToLive().ifPresent(httpClient::connectionTimeToLive);
+      config.expectContinueEnabled().ifPresent(httpClient::expectContinueEnabled);
+
+      LOGGER.warn(
+          "Creating HTTP client with SSL certificate verification disabled. "
+              + "This should only be used in development environments!");
+
+      return httpClient.build();
+    } catch (Exception e) {
+      LOGGER.error("Failed to create insecure HTTP client, falling back to secure client", e);
+      return sdkHttpClient(config);
+    }
+  }
+
   public void closeSdkHttpClient(
       @Disposes @Identifier("aws-sdk-http-client") SdkHttpClient client) {
     client.close();
@@ -237,7 +277,10 @@ public class ServiceProducers {
       @Identifier("aws-sdk-http-client") SdkHttpClient httpClient,
       StorageConfiguration config,
       MeterRegistry meterRegistry) {
-    return new StsClientsPool(config.effectiveClientsCacheMaxSize(), httpClient, meterRegistry);
+    // Create insecure HTTP client for SSL bypass scenarios
+    SdkHttpClient insecureHttpClient = createInsecureHttpClient(config);
+    return new StsClientsPool(
+        config.effectiveClientsCacheMaxSize(), httpClient, insecureHttpClient, meterRegistry);
   }
 
   /**

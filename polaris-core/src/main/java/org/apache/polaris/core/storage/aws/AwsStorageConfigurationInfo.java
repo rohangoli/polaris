@@ -44,9 +44,11 @@ public abstract class AwsStorageConfigurationInfo extends PolarisStorageConfigur
     return ImmutableAwsStorageConfigurationInfo.builder();
   }
 
-  // Technically, it should be ^arn:(aws|aws-cn|aws-us-gov):iam::(\d{12}):role/.+$,
+  // Support both AWS ARN (arn:aws:iam::123456789012:role/test-role) and S3-Compatible ARN
+  // (urn:ecs:iam::namespace:role/test-role)
   @JsonIgnore
-  public static final String ROLE_ARN_PATTERN = "^arn:(aws|aws-us-gov):iam::(\\d{12}):role/.+$";
+  public static final String ROLE_ARN_PATTERN =
+      "^(arn:(aws|aws-us-gov):iam::(\\d{12})|urn:ecs:iam::([a-zA-Z0-9_]+)):role/.+$";
 
   private static final Pattern ROLE_ARN_PATTERN_COMPILED = Pattern.compile(ROLE_ARN_PATTERN);
 
@@ -86,13 +88,41 @@ public abstract class AwsStorageConfigurationInfo extends PolarisStorageConfigur
   @JsonIgnore
   @Nullable
   public URI getEndpointUri() {
-    return getEndpoint() == null ? null : URI.create(getEndpoint());
+    return normalizeToUri(getEndpoint());
   }
 
   @JsonIgnore
   @Nullable
   public URI getInternalEndpointUri() {
-    return getEndpointInternal() == null ? getEndpointUri() : URI.create(getEndpointInternal());
+    return normalizeToUri(getEndpointInternal()) == null
+        ? getEndpointUri()
+        : normalizeToUri(getEndpointInternal());
+  }
+
+  /**
+   * Normalize a possibly-relative or scheme-less endpoint string into an absolute URI. If the input
+   * is null or cannot be parsed, returns null. If the input has no scheme, default to https scheme.
+   */
+  @JsonIgnore
+  @Nullable
+  private static URI normalizeToUri(@Nullable String maybe) {
+    if (maybe == null) {
+      return null;
+    }
+    try {
+      URI uri = URI.create(maybe);
+      if (uri.getScheme() == null || uri.getScheme().isEmpty()) {
+        // default to https when no scheme provided
+        return URI.create("https://" + maybe);
+      }
+      return uri;
+    } catch (Exception e) {
+      try {
+        return URI.create("https://" + maybe);
+      } catch (Exception ex) {
+        return null;
+      }
+    }
   }
 
   /** Flag indicating whether path-style bucket access should be forced in S3 clients. */
@@ -101,6 +131,9 @@ public abstract class AwsStorageConfigurationInfo extends PolarisStorageConfigur
   /** Endpoint URI for STS API calls */
   @Nullable
   public abstract String getStsEndpoint();
+
+  /** Flag indicating whether SSL certificate verification should be disabled */
+  public abstract @Nullable Boolean getIgnoreSSLVerification();
 
   /** Returns the STS endpoint if set, defaulting to {@link #getEndpointUri()} otherwise. */
   @JsonIgnore
@@ -116,7 +149,9 @@ public abstract class AwsStorageConfigurationInfo extends PolarisStorageConfigur
     if (arn != null) {
       Matcher matcher = ROLE_ARN_PATTERN_COMPILED.matcher(arn);
       checkState(matcher.matches());
-      return matcher.group(2);
+      // Group 3 for AWS ARN (arn:aws:iam::123456789012:role/...), Group 4 for S3-compatible ARN
+      // (urn:ecs:iam::otf_dev:role/...)
+      return matcher.group(3) != null ? matcher.group(3) : matcher.group(4);
     }
     return null;
   }
@@ -128,7 +163,8 @@ public abstract class AwsStorageConfigurationInfo extends PolarisStorageConfigur
     if (arn != null) {
       Matcher matcher = ROLE_ARN_PATTERN_COMPILED.matcher(arn);
       checkState(matcher.matches());
-      return matcher.group(1);
+      // Group 2 for AWS ARN partition (aws|aws-us-gov), return "ecs" for S3-compatible ARN
+      return matcher.group(2) != null ? matcher.group(2) : "ecs";
     }
     return null;
   }

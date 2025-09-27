@@ -29,9 +29,13 @@ dependencies {
   api(platform(libs.awssdk.bom))
   api("software.amazon.awssdk:s3")
   api("software.amazon.awssdk:kms")
-
   implementation(project(":polaris-container-spec-helper"))
   implementation("software.amazon.awssdk:url-connection-client")
+  // The AWS SDK 'checksums' module provides RequestChecksumCalculation and
+  // ResponseChecksumValidation used by the S3 client builder.
+  implementation("software.amazon.awssdk:checksums")
+
+  implementation(project(":polaris-container-spec-helper"))
   implementation(libs.guava)
 
   compileOnly(platform(libs.junit.bom))
