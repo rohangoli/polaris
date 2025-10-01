@@ -136,7 +136,8 @@ public class AwsCredentialsStorageIntegration
     // Some STS endpoints (especially custom/on-prem ECS variants) may return a successful
     // HTTP response but the SDK-parsed AssumeRoleResponse.credentials() may be null.
     // Detect that and attempt a single retry using the AWS-style fallback policy; if we still
-    // don't receive credentials, surface a clear error with the raw response for diagnostics.
+    // don't receive credentials, attempt to parse raw XML as a final fallback and then
+    // surface a clear error with the raw response for diagnostics.
     if (response == null || response.credentials() == null) {
       LOG.warn(
           "AssumeRole returned empty credentials (response={}). Attempting one retry with AWS arn prefix.",
@@ -149,6 +150,7 @@ public class AwsCredentialsStorageIntegration
       }
       AssumeRoleRequest retryRequest = request.policy(fallbackPolicyJson).build();
       response = stsClient.assumeRole(retryRequest);
+
       // If SDK still didn't populate credentials, attempt to parse the raw XML captured
       // by the StsClientsPool debug interceptor (best-effort). This helps with some ECS
       // on-prem STS endpoints that return non-standard xmlns values that confuse the SDK.
@@ -213,13 +215,17 @@ public class AwsCredentialsStorageIntegration
           LOG.debug("ECS XML fallback parse failed", e);
         }
       }
+
       if (response == null || response.credentials() == null) {
         String respStr = response == null ? "null" : response.toString();
         LOG.error("AssumeRole retry did not return credentials. response={}", respStr);
         throw new UnprocessableEntityException("Failed to get subscoped credentials: %s", respStr);
       }
+    }
 
-      accessConfig.put(StorageAccessProperty.AWS_KEY_ID, response.credentials().accessKeyId());
+    // At this point we have a non-null response with credentials (either from the
+    // initial call or after retry/fallback). Populate the AccessConfig with values.
+    accessConfig.put(StorageAccessProperty.AWS_KEY_ID, response.credentials().accessKeyId());
     accessConfig.put(
         StorageAccessProperty.AWS_SECRET_KEY, response.credentials().secretAccessKey());
     accessConfig.put(StorageAccessProperty.AWS_TOKEN, response.credentials().sessionToken());
@@ -252,15 +258,14 @@ public class AwsCredentialsStorageIntegration
           StorageAccessProperty.AWS_ENDPOINT.getPropertyName(), internalEndpointUri.toString());
     }
 
-      if (Boolean.TRUE.equals(storageConfig.getPathStyleAccess())) {
-        accessConfig.put(StorageAccessProperty.AWS_PATH_STYLE_ACCESS, Boolean.TRUE.toString());
-      }
+    if (Boolean.TRUE.equals(storageConfig.getPathStyleAccess())) {
+      accessConfig.put(StorageAccessProperty.AWS_PATH_STYLE_ACCESS, Boolean.TRUE.toString());
+    }
 
-      if ("aws-us-gov".equals(storageConfig.getAwsPartition()) && region == null) {
-        throw new IllegalArgumentException(
-            String.format(
-                "AWS region must be set when using partition %s", storageConfig.getAwsPartition()));
-      }
+    if ("aws-us-gov".equals(storageConfig.getAwsPartition()) && region == null) {
+      throw new IllegalArgumentException(
+          String.format(
+              "AWS region must be set when using partition %s", storageConfig.getAwsPartition()));
     }
     }
 

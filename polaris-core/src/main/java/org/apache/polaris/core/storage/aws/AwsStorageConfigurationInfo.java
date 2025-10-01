@@ -48,7 +48,7 @@ public abstract class AwsStorageConfigurationInfo extends PolarisStorageConfigur
   // (urn:ecs:iam::namespace:role/test-role)
   @JsonIgnore
   public static final String ROLE_ARN_PATTERN =
-      "^(arn:(aws|aws-us-gov):iam::(\\d{12})|urn:ecs:iam::([a-zA-Z0-9_]+)):role/.+$";
+      "^(arn:(aws|aws-us-gov):iam::(\\d{12})|urn:ecs:iam::([a-zA-Z0-9_-]+)):role/.+$";
 
   private static final Pattern ROLE_ARN_PATTERN_COMPILED = Pattern.compile(ROLE_ARN_PATTERN);
 

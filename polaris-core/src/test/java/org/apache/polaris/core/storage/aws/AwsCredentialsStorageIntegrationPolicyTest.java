@@ -87,6 +87,11 @@ public class AwsCredentialsStorageIntegrationPolicyTest {
           public java.util.List<String> getAllowedLocations() {
             return java.util.Collections.emptyList();
           }
+
+          @Override
+          public Boolean getStsUnavailable() {
+            return null;
+          }
         };
     AwsCredentialsStorageIntegration integ =
         new AwsCredentialsStorageIntegration(cfg, DUMMY_PROVIDER);
