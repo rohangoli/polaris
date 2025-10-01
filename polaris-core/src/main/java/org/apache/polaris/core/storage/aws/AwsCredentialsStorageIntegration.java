@@ -84,52 +84,34 @@ public class AwsCredentialsStorageIntegration
     int storageCredentialDurationSeconds =
         realmConfig.getConfig(STORAGE_CREDENTIAL_DURATION_SECONDS);
     AwsStorageConfigurationInfo storageConfig = config();
-    final String policyJson =
-        policyString(
-                storageConfig.getAwsPartition(),
-                allowListOperation,
-                allowedReadLocations,
-                allowedWriteLocations)
-            .toJson();
-
-    if (LOG.isDebugEnabled()) {
-      LOG.debug("Generated AssumeRole policy: {}", policyJson);
-    }
-
-    // Debug: dump raw and normalized endpoint information to help diagnose propagation
-    try {
-      if (LOG.isDebugEnabled()) {
-        LOG.debug(
-            "StorageConfig endpoints: endpoint='{}' endpointInternal='{}' pathStyleAccess='{}' -> endpointUri='{}' internalEndpointUri='{}'",
-            storageConfig.getEndpoint(),
-            storageConfig.getEndpointInternal(),
-            storageConfig.getPathStyleAccess(),
-            storageConfig.getEndpointUri(),
-            storageConfig.getInternalEndpointUri());
-      }
-    } catch (Exception e) {
-      LOG.debug("Failed to log storage config endpoints", e);
-    }
-
-    AssumeRoleRequest.Builder request =
-        AssumeRoleRequest.builder()
-            .externalId(storageConfig.getExternalId())
-            .roleArn(storageConfig.getRoleARN())
-            .roleSessionName("PolarisAwsCredentialsStorageIntegration")
-            .policy(policyJson)
-            .durationSeconds(storageCredentialDurationSeconds);
-    credentialsProvider.ifPresent(
-        cp -> request.overrideConfiguration(b -> b.credentialsProvider(cp)));
-
     String region = storageConfig.getRegion();
-    @SuppressWarnings("resource")
-    // Note: stsClientProvider returns "thin" clients that do not need closing
-    StsClient stsClient =
-        stsClientProvider.stsClient(
-            StsDestination.of(
-                storageConfig.getStsEndpointUri(),
-                region,
-                storageConfig.getIgnoreSSLVerification()));
+    AccessConfig.Builder accessConfig = AccessConfig.builder();
+
+    if (shouldUseSts(storageConfig)) {
+      AssumeRoleRequest.Builder request =
+          AssumeRoleRequest.builder()
+              .externalId(storageConfig.getExternalId())
+              .roleArn(storageConfig.getRoleARN())
+              .roleSessionName("PolarisAwsCredentialsStorageIntegration")
+              .policy(
+                  policyString(
+                          storageConfig.getAwsPartition(),
+                          allowListOperation,
+                          allowedReadLocations,
+                          allowedWriteLocations)
+                      .toJson())
+              .durationSeconds(storageCredentialDurationSeconds);
+      credentialsProvider.ifPresent(
+          cp -> request.overrideConfiguration(b -> b.credentialsProvider(cp)));
+
+      @SuppressWarnings("resource")
+      // Note: stsClientProvider returns "thin" clients that do not need closing
+      StsClient stsClient =
+          stsClientProvider.stsClient(
+              StsDestination.of(
+                  storageConfig.getStsEndpointUri(),
+                  region,
+                  storageConfig.getIgnoreSSLVerification()));
 
     AssumeRoleResponse response;
     try {
@@ -236,10 +218,8 @@ public class AwsCredentialsStorageIntegration
         LOG.error("AssumeRole retry did not return credentials. response={}", respStr);
         throw new UnprocessableEntityException("Failed to get subscoped credentials: %s", respStr);
       }
-    }
 
-    AccessConfig.Builder accessConfig = AccessConfig.builder();
-    accessConfig.put(StorageAccessProperty.AWS_KEY_ID, response.credentials().accessKeyId());
+      accessConfig.put(StorageAccessProperty.AWS_KEY_ID, response.credentials().accessKeyId());
     accessConfig.put(
         StorageAccessProperty.AWS_SECRET_KEY, response.credentials().secretAccessKey());
     accessConfig.put(StorageAccessProperty.AWS_TOKEN, response.credentials().sessionToken());
@@ -272,17 +252,23 @@ public class AwsCredentialsStorageIntegration
           StorageAccessProperty.AWS_ENDPOINT.getPropertyName(), internalEndpointUri.toString());
     }
 
-    if (Boolean.TRUE.equals(storageConfig.getPathStyleAccess())) {
-      accessConfig.put(StorageAccessProperty.AWS_PATH_STYLE_ACCESS, Boolean.TRUE.toString());
-    }
+      if (Boolean.TRUE.equals(storageConfig.getPathStyleAccess())) {
+        accessConfig.put(StorageAccessProperty.AWS_PATH_STYLE_ACCESS, Boolean.TRUE.toString());
+      }
 
-    if ("aws-us-gov".equals(storageConfig.getAwsPartition()) && region == null) {
-      throw new IllegalArgumentException(
-          String.format(
-              "AWS region must be set when using partition %s", storageConfig.getAwsPartition()));
+      if ("aws-us-gov".equals(storageConfig.getAwsPartition()) && region == null) {
+        throw new IllegalArgumentException(
+            String.format(
+                "AWS region must be set when using partition %s", storageConfig.getAwsPartition()));
+      }
+    }
     }
 
     return accessConfig.build();
+  }
+
+  private boolean shouldUseSts(AwsStorageConfigurationInfo storageConfig) {
+    return !Boolean.TRUE.equals(storageConfig.getStsUnavailable());
   }
 
   /**
